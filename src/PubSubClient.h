@@ -38,6 +38,19 @@ private:
    unsigned long lastInActivity;
    bool pingOutstanding;
 
+   //! Receive a message from the client
+   /*!
+     \return Pointer to message object, NULL if no message has been received
+    */
+   MQTT::Message* _recv_message(void);
+
+   //! Send a message and wait for its response message (if it has one)
+   /*!
+     \param msg The message to send
+     \param need_reply Do we wait for the reply message?
+    */
+   bool _send_message(MQTT::Message& msg, bool need_reply = false);
+
    //! Process incoming messages
    /*!
      - Calls the callback function when a PUBLISH message comes in
@@ -55,12 +68,6 @@ private:
      \return True if we received the packet we wanted
     */
    bool _wait_for(MQTT::message_type wait_type, uint16_t wait_pid = 0);
-
-   //! Send a message and wait for its response message (if it has one)
-   /*!
-     \param msg The message to send
-    */
-   bool _send_reliably(MQTT::Message* msg);
 
    //! Return the next packet id
    uint16_t _next_packet_id(void) {
@@ -134,6 +141,14 @@ public:
      name.
     */
    bool publish(String topic, const uint8_t *payload, uint32_t plength, bool retained = false);
+
+   //! Publish an arbitrary data payload from a callback
+   /*!
+     \param topic Topic of this message
+     \param pcb A callback function that writes the payload directly to the network Client object
+     \param length The length of the data that 'pcb' will send
+   */
+   bool publish(String topic, MQTT::payload_callback_t pcb, uint32_t length, bool retained = false);
 
    //! Publish an arbitrary data payload stored in "program" memory
    /*!

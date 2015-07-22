@@ -43,6 +43,7 @@ namespace MQTT {
     write(buf, length_pos, count);
   }
 
+  //! Template function to read from a buffer
   template <typename T>
   T read(uint8_t *buf, uint32_t& pos);
 
@@ -65,6 +66,34 @@ namespace MQTT {
     val.reserve(len);
     for (uint16_t i = 0; i < len; i++)
       val += (char)read<uint8_t>(buf, pos);
+
+    return val;
+  }
+
+  //! Template function to read from a Client object
+  template <typename T>
+  T read(Client& client);
+
+  template <>
+  uint8_t read<uint8_t>(Client& client) {
+    while(!client.available()) {}
+    return client.read();
+  }
+
+  template <>
+  uint16_t read<uint16_t>(Client& client) {
+    uint16_t val = read<uint8_t>(client) << 8;
+    val |= read<uint8_t>(client);
+    return val;
+  }
+
+  template <>
+  String read<String>(Client& client) {
+    uint16_t len = read<uint16_t>(client);
+    String val;
+    val.reserve(len);
+    for (uint16_t i = 0; i < len; i++)
+      val += (char)read<uint8_t>(client);
 
     return val;
   }
@@ -111,30 +140,38 @@ namespace MQTT {
   }
 
   bool Message::send(Client& client) {
-    uint32_t remaining_length = variable_header_length() + payload_length();
-    uint32_t packet_length = fixed_header_length(remaining_length) + remaining_length;
+    uint32_t variable_header_len = variable_header_length();
+    uint32_t remaining_length = variable_header_len + payload_length();
+    uint32_t packet_length = fixed_header_length(remaining_length);
+    if (_payload_callback == NULL)
+      packet_length += remaining_length;
+    else
+      packet_length += variable_header_len;
+
     uint8_t *packet = new uint8_t[packet_length];
 
     uint32_t pos = 0;
     write_fixed_header(packet, pos, remaining_length);
     write_variable_header(packet, pos);
+
     write_payload(packet, pos);
 
     uint32_t sent = client.write(const_cast<const uint8_t*>(packet), packet_length);
     delete [] packet;
-    return (sent == packet_length);
+    if (sent != packet_length)
+      return false;
+
+    if (_payload_callback != NULL)
+      return _payload_callback(client);
+
+    return true;
   }
 
-
-  uint8_t readByte(Client& client) {
-    while(!client.available()) {}
-    return client.read();
-  }
 
   // Parser
   Message* readPacket(Client& client) {
     // Read type and flags
-    uint8_t type = readByte(client);
+    uint8_t type = read<uint8_t>(client);
     uint8_t flags = type & 0x0f;
     type >>= 4;
 
@@ -144,7 +181,7 @@ namespace MQTT {
     uint8_t shifter = 0;
     uint8_t digit;
     do {
-      digit = readByte(client);
+      digit = read<uint8_t>(client);
       lenbuf[lenlen++] = digit;
       remaining_length += (digit & 0x7f) << shifter;
       shifter += 7;
@@ -153,6 +190,17 @@ namespace MQTT {
     // Read variable header and/or payload
     uint8_t *remaining_data = NULL;
     if (remaining_length > 0) {
+      if (remaining_length > 1024) {
+	switch (type) {
+	case PUBLISH:
+	  return new Publish(flags, client, remaining_length);
+	case SUBACK:
+	  return new SubscribeAck(client, remaining_length);
+	default:
+	  return NULL;
+	}
+      }
+
       remaining_data = new uint8_t[remaining_length];
       uint32_t r = remaining_length;
       while (client.available() && r) {
@@ -196,11 +244,11 @@ namespace MQTT {
       break;
 
     case PINGREQ:
-      obj = new Ping(remaining_data, remaining_length);
+      obj = new Ping;
       break;
 
     case PINGRESP:
-      obj = new PingResp(remaining_data, remaining_length);
+      obj = new PingResp;
       break;
 
     }
@@ -340,8 +388,37 @@ namespace MQTT {
     }
   }
 
+  Publish::Publish(String topic, payload_callback_t pcb, uint32_t length) :
+    Message(PUBLISH),
+    _topic(topic),
+    _payload_len(length),
+    _payload(NULL), _payload_mine(false)
+  {
+    _payload_callback = pcb;
+  }
+
+  Publish::Publish(uint8_t flags, Client& client, uint32_t remaining_length) :
+    Message(PUBLISH, flags),
+    _payload(NULL), _payload_len(remaining_length),
+    _payload_mine(false)
+  {
+    _stream_client = &client;
+
+    // Read the topic
+    _topic = read<String>(client);
+    _payload_len -= 2 + _topic.length();
+
+    if (qos() > 0) {
+      // Read the packet id
+      _packet_id = read<uint16_t>(client);
+      _payload_len -= 2;
+    }
+
+    // Client stream is now at the start of the payload
+  }
+
   Publish::~Publish() {
-    if (_payload_mine)
+    if ((_payload_mine) && (_payload != NULL))
       delete [] _payload;
   }
 
@@ -381,7 +458,8 @@ namespace MQTT {
   }
 
   void Publish::write_payload(uint8_t *buf, uint32_t& bufpos) const {
-    write(buf, bufpos, _payload, _payload_len);
+    if (_payload != NULL)
+      write(buf, bufpos, _payload, _payload_len);
   }
 
   message_type Publish::response_type(void) const {
@@ -398,8 +476,10 @@ namespace MQTT {
 
   // PublishAck class
   PublishAck::PublishAck(uint16_t pid) :
-    Message(PUBACK, pid)
-  {}
+    Message(PUBACK)
+  {
+    _packet_id = pid;
+  }
 
   PublishAck::PublishAck(uint8_t* data, uint32_t length) :
     Message(PUBACK)
@@ -411,8 +491,10 @@ namespace MQTT {
 
   // PublishRec class
   PublishRec::PublishRec(uint16_t pid) :
-    Message(PUBREC, pid)
-  {}
+    Message(PUBREC)
+  {
+    _packet_id = pid;
+  }
 
   PublishRec::PublishRec(uint8_t* data, uint32_t length) :
     Message(PUBREC)
@@ -432,8 +514,10 @@ namespace MQTT {
 
   // PublishRel class
   PublishRel::PublishRel(uint16_t pid) :
-    Message(PUBREL, pid)
-  {}
+    Message(PUBREL)
+  {
+    _packet_id = pid;
+  }
 
   PublishRel::PublishRel(uint8_t* data, uint32_t length) :
     Message(PUBREL)
@@ -453,8 +537,10 @@ namespace MQTT {
 
   // PublishComp class
   PublishComp::PublishComp(uint16_t pid) :
-    Message(PUBREC, pid)
-  {}
+    Message(PUBREC)
+  {
+    _packet_id = pid;
+  }
 
   PublishComp::PublishComp(uint8_t* data, uint32_t length) :
     Message(PUBCOMP)
@@ -474,14 +560,17 @@ namespace MQTT {
 
   // Subscribe class
   Subscribe::Subscribe() :
-    Message(SUBSCRIBE, 0, true),
-    _buffer(NULL), _buflen(0)
-  {}
-
-  Subscribe::Subscribe(String topic, uint8_t qos) :
-    Message(SUBSCRIBE, 0, true),
+    Message(SUBSCRIBE),
     _buffer(NULL), _buflen(0)
   {
+    _need_packet_id = true;
+  }
+
+  Subscribe::Subscribe(String topic, uint8_t qos) :
+    Message(SUBSCRIBE),
+    _buffer(NULL), _buflen(0)
+  {
+    _need_packet_id = true;
     _buffer = new uint8_t[2 + topic.length() + 1];
     write(_buffer, _buflen, topic);
     _buffer[_buflen++] = qos;
@@ -531,22 +620,42 @@ namespace MQTT {
     }
   }
 
+  SubscribeAck::SubscribeAck(Client& client, uint32_t remaining_length) :
+    Message(SUBACK),
+    _rcs(NULL),
+    _num_rcs(remaining_length - 2)
+  {
+    _stream_client = &client;
+
+    // Read packet id
+    _packet_id = read<uint16_t>(client);
+
+    // Client stream is now at the start of the list of rcs
+  }
+
   SubscribeAck::~SubscribeAck() {
     if (_rcs != NULL)
       delete [] _rcs;
   }
 
+  uint8_t SubscribeAck::next_rc(void) const {
+    return read<uint8_t>(*_stream_client);
+  }
+
 
   // Unsubscribe class
   Unsubscribe::Unsubscribe() :
-    Message(SUBSCRIBE, 0, true),
-    _buffer(NULL), _buflen(0)
-  {}
-
-  Unsubscribe::Unsubscribe(String topic) :
-    Message(SUBSCRIBE, 0, true),
+    Message(SUBSCRIBE),
     _buffer(NULL), _buflen(0)
   {
+    _need_packet_id = true;
+  }
+
+  Unsubscribe::Unsubscribe(String topic) :
+    Message(SUBSCRIBE),
+    _buffer(NULL), _buflen(0)
+  {
+    _need_packet_id = true;
     _buffer = (uint8_t*)malloc(2 + topic.length());
     write(_buffer, _buflen, topic);
   }

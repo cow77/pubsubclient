@@ -1,8 +1,8 @@
 /*
- MQTT subscriber example
+ Large publish message MQTT example
 
   - connects to an MQTT server
-  - subscribes to the topic "inTopic"
+  - publishes a large string of text to the topic "outTopic"
 */
 
 #include <ESP8266WiFi.h>
@@ -14,23 +14,6 @@ const char *pass =	"yyyyyyyy";		//
 // Update these with values suitable for your network.
 IPAddress server(172, 16, 0, 2);
 
-#define BUFFER_SIZE 100
-
-void callback(const MQTT::Publish& pub) {
-  Serial.print(pub.topic());
-  Serial.print(" => ");
-  if (pub.has_stream()) {
-    uint8_t buf[BUFFER_SIZE];
-    int read;
-    while (read = pub.payload_stream()->read(buf, BUFFER_SIZE)) {
-      Serial.write(buf, read);
-    }
-    pub.payload_stream()->stop();
-    Serial.println("");
-  } else
-    Serial.println(pub.payload_string());
-}
-
 WiFiClient wclient;
 PubSubClient client(wclient, server);
 
@@ -40,6 +23,21 @@ void setup() {
   delay(10);
   Serial.println();
   Serial.println();
+}
+
+bool write_payload(Client& payload_stream) {
+  char buf[64];
+  memset(buf, 32, 64);
+  for (int l = 0; l < 1024; l++) {
+    int len = sprintf(buf, "%d", l);
+    buf[len] = 32;
+    buf[63] = '\n';
+    uint32_t sent = payload_stream.write((const uint8_t*)buf, 64);
+    if (sent < 64)
+      return false;
+  }
+  Serial.println("Published large message.");
+  return true;
 }
 
 void loop() {
@@ -57,8 +55,7 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!client.connected()) {
       if (client.connect("arduinoClient")) {
-	client.set_callback(callback);
-	client.subscribe("inTopic");
+	client.publish("outTopic", write_payload, 65536);
       }
     }
 
@@ -66,3 +63,4 @@ void loop() {
       client.loop();
   }
 }
+

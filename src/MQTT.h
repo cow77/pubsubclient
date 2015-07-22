@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 #include <stdint.h>
 #ifdef ESP8266
 #include <pgmspace.h>
+#include <functional>
 #endif
 #include <Client.h>
 
@@ -52,6 +53,12 @@ namespace MQTT {
     Reserved,		// Reserved
   };
 
+#ifdef _GLIBCXX_FUNCTIONAL
+  typedef std::function<bool(Client&)> payload_callback_t;
+#else
+  typedef bool(*payload_callback_t)(Client&);
+#endif
+
   //! Abstract base class
   class Message {
   protected:
@@ -59,20 +66,14 @@ namespace MQTT {
     uint8_t _flags;
     uint16_t _packet_id;	//! Not all message types use a packet id, but most do
     bool _need_packet_id;
-    bool _deferred_payload;
+    Client* _stream_client;
+    payload_callback_t _payload_callback;
 
     //! Private constructor from type and flags
     Message(message_type t, uint8_t f = 0) :
       _type(t), _flags(f),
       _packet_id(0), _need_packet_id(false),
-      _deferred_payload(false)
-    {}
-
-    //! Private constructor from type and packet id
-    Message(message_type t, uint16_t pid, bool npid = false) :
-      _type(t), _flags(0),
-      _packet_id(pid), _need_packet_id(npid),
-      _deferred_payload(false)
+      _stream_client(NULL)
     {}
 
     //! Virtual destructor
@@ -140,6 +141,9 @@ namespace MQTT {
     //! Get the message type
     message_type type(void) const { return _type; }
 
+    //! Does this message have a network stream for reading the (large) payload?
+    bool has_stream(void) const { return _stream_client != NULL; }
+
   };
 
   //! Parser
@@ -206,9 +210,10 @@ namespace MQTT {
     bool _session_present;
     uint8_t _rc;
 
-  public:
-    //! Construct from a network buffer
+    //! Private constructor from a network buffer
     ConnectAck(uint8_t* data, uint32_t length);
+
+    friend Message* readPacket(Client& client);
   };
 
 
@@ -235,22 +240,44 @@ namespace MQTT {
       _payload_mine(mine)
     {}
 
+    //! Private constructor from a network buffer
+    Publish(uint8_t flags, uint8_t* data, uint32_t length);
+
+    //! Private constructor from a network stream
+    Publish(uint8_t flags, Client& client, uint32_t remaining_length);
+
+    friend Message* readPacket(Client& client);
+
   public:
-    //! Constructors from string payload
+    //! Constructor from string payload
+    /*!
+      \param topic Topic of this message
+      \param payload Payload of this message
+     */
     Publish(String topic, String payload);
 
-    //! Constructors from arbitrary payload
+    //! Constructor from arbitrary payload
+    /*!
+      \param topic Topic of this message
+      \param payload Pointer to a block of data
+      \param length The length of the data stored at 'payload'
+     */
     Publish(String topic, uint8_t* payload, uint32_t length) :
       Publish(topic, payload, length, false)
     {}
+
+    //! Constructor from a callback
+    /*!
+      \param topic Topic of this message
+      \param pcb A callback function that writes the payload directly to the network Client object
+      \param length The length of the data that 'pcb' will send
+     */
+    Publish(String topic, payload_callback_t pcb, uint32_t length);
 
     //! Constructor from a string stored in flash using the F() macro
     Publish(String topic, const __FlashStringHelper* payload);
 
     friend Publish Publish_P(String topic, PGM_P payload, uint32_t length);
-
-    //! Construct from a network buffer
-    Publish(uint8_t flags, uint8_t* data, uint32_t length);
 
     ~Publish();
 
@@ -286,6 +313,8 @@ namespace MQTT {
     //! Get the payload length
     uint32_t payload_len(void) const { return _payload_len; }
 
+    //! Get the network stream for reading the payload
+    Client* payload_stream(void) const { return _stream_client; }
   };
 
   //! A function made to look like a constructor, reading the payload from flash
@@ -294,12 +323,16 @@ namespace MQTT {
 
   //! Response to Publish when qos == 1
   class PublishAck : public Message {
+  private:
+    //! Private constructor from a network buffer
+    PublishAck(uint8_t* data, uint32_t length);
+
+    friend Message* readPacket(Client& client);
+
   public:
-    //! Construct with a packet id
+    //! Constructor from a packet id
     PublishAck(uint16_t pid);
 
-    //! Construct from a network buffer
-    PublishAck(uint8_t* data, uint32_t length);
   };
 
 
@@ -311,12 +344,14 @@ namespace MQTT {
 
     message_type response_type(void) const { return PUBREL; }
 
-  public:
-    //! Construct with a packet id
-    PublishRec(uint16_t pid);
-
-    //! Construct from a network buffer
+    //! Private constructor from a network buffer
     PublishRec(uint8_t* data, uint32_t length);
+
+    friend Message* readPacket(Client& client);
+
+  public:
+    //! Constructor from a packet id
+    PublishRec(uint16_t pid);
 
   };
 
@@ -329,12 +364,14 @@ namespace MQTT {
 
     message_type response_type(void) const { return PUBCOMP; }
 
-  public:
-    //! Construct with a packet id
-    PublishRel(uint16_t pid);
-
-    //! Construct from a network buffer
+    //! Private constructor from a network buffer
     PublishRel(uint8_t* data, uint32_t length);
+
+    friend Message* readPacket(Client& client);
+
+  public:
+    //! Constructor from a packet id
+    PublishRel(uint16_t pid);
 
   };
 
@@ -345,12 +382,15 @@ namespace MQTT {
     uint32_t variable_header_length(void) const;
     void write_variable_header(uint8_t *buf, uint32_t& bufpos) const;
 
+    //! Private constructor from a network buffer
+    PublishComp(uint8_t* data, uint32_t length);
+
+    friend Message* readPacket(Client& client);
+
   public:
-    //! Construct with a packet id
+    //! Constructor from a packet id
     PublishComp(uint16_t pid);
 
-    //! Construct from a network buffer
-    PublishComp(uint8_t* data, uint32_t length);
   };
 
 
@@ -371,7 +411,7 @@ namespace MQTT {
     //! Constructor that starts an empty list of subscriptions
     Subscribe();
 
-    //! Subscribe with a topic and optional QoS level
+    //! Constructor from a topic and optional QoS level
     Subscribe(String topic, uint8_t qos = 0);
 
     ~Subscribe();
@@ -388,10 +428,15 @@ namespace MQTT {
     uint8_t *_rcs;
     uint32_t _num_rcs;
 
-  public:
-    //! Construct from a network buffer
+    //! Private constructor from a network buffer
     SubscribeAck(uint8_t* data, uint32_t length);
 
+    //! Private constructor from a network stream
+    SubscribeAck(Client& client, uint32_t remaining_length);
+
+    friend Message* readPacket(Client& client);
+
+  public:
     ~SubscribeAck();
 
     //! Get the number of return codes available
@@ -399,6 +444,9 @@ namespace MQTT {
 
     //! Get a return code
     uint8_t rc(uint8_t i) const { return _rcs[i]; }
+
+    //! Get the next return code from a stream
+    uint8_t next_rc(void) const;
 
   };
 
@@ -420,7 +468,7 @@ namespace MQTT {
     //! Constructor that starts with an empty list of unsubscriptions
     Unsubscribe();
 
-    //! Unsubscribe from a topic
+    //! Constructor from a topic
     Unsubscribe(String topic);
 
     ~Unsubscribe();
@@ -433,9 +481,11 @@ namespace MQTT {
 
   //! Response to Unsubscribe
   class UnsubscribeAck : public Message {
-  public:
-    //! Construct from a network buffer
+  private:
+    //! Private constructor from a network buffer
     UnsubscribeAck(uint8_t* data, uint32_t length);
+
+    friend Message* readPacket(Client& client);
 
   };
 
@@ -451,11 +501,6 @@ namespace MQTT {
       Message(PINGREQ)
     {}
 
-    //! Construct from a network buffer
-    Ping(uint8_t* data, uint32_t length) :
-      Message(PINGREQ)
-    {}
-
   };
 
 
@@ -464,11 +509,6 @@ namespace MQTT {
   public:
     //! Constructor
     PingResp() :
-      Message(PINGRESP)
-    {}
-
-    //! Construct from a network buffer
-    PingResp(uint8_t* data, uint32_t length) :
       Message(PINGRESP)
     {}
 
